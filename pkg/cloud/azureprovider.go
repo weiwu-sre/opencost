@@ -22,6 +22,7 @@ import (
 	"golang.org/x/text/cases"
 	"golang.org/x/text/language"
 
+	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2021-11-01/compute"
 	"github.com/Azure/azure-sdk-for-go/services/preview/commerce/mgmt/2015-06-01-preview/commerce"
 	"github.com/Azure/azure-sdk-for-go/services/resources/mgmt/2016-06-01/subscriptions"
 	"github.com/Azure/azure-sdk-for-go/services/resources/mgmt/2018-05-01/resources"
@@ -40,6 +41,8 @@ const (
 	defaultSpotLabel                 = "kubernetes.azure.com/scalesetpriority"
 	defaultSpotLabelValue            = "spot"
 	AzureStorageUpdateType           = "AzureStorage"
+
+	hoursPerMonth = 730
 )
 
 var toTitle = cases.Title(language.Und, cases.NoLower)
@@ -521,7 +524,7 @@ func (ask *AzureServiceKey) IsValid() bool {
 }
 
 // Loads the azure authentication via configuration or a secret set at install time.
-func (az *Azure) getAzureRateCardAuth(forceReload bool, cp *CustomPricing) (subscriptionID, clientID, clientSecret, tenantID string) {
+func (az *Azure) getAzureAuth(forceReload bool, cp *CustomPricing) (subscriptionID, clientID, clientSecret, tenantID string) {
 	// 1. Check for secret (secret values will always be used if they are present)
 	s, _ := az.loadAzureAuthSecret(forceReload)
 	if s != nil && s.IsValid() {
@@ -778,7 +781,7 @@ func (az *Azure) DownloadPricingData() error {
 	}
 
 	// Load the service provider keys
-	subscriptionID, clientID, clientSecret, tenantID := az.getAzureRateCardAuth(false, config)
+	subscriptionID, clientID, clientSecret, tenantID := az.getAzureAuth(false, config)
 	config.AzureSubscriptionID = subscriptionID
 	config.AzureClientID = clientID
 	config.AzureClientSecret = clientSecret
@@ -1169,8 +1172,136 @@ func (*Azure) GetAddresses() ([]byte, error) {
 	return nil, nil
 }
 
-func (*Azure) GetDisks() ([]byte, error) {
-	return nil, nil
+func (az *Azure) GetDisks() ([]byte, error) {
+	disks, err := az.getDisks()
+	if err != nil {
+		return nil, err
+	}
+
+	return json.Marshal(disks)
+}
+
+func (az *Azure) getDisks() ([]*compute.Disk, error) {
+	config, err := az.GetConfig()
+	if err != nil {
+		return nil, err
+	}
+
+	// Load the service provider keys
+	subscriptionID, clientID, clientSecret, tenantID := az.getAzureAuth(false, config)
+	config.AzureSubscriptionID = subscriptionID
+	config.AzureClientID = clientID
+	config.AzureClientSecret = clientSecret
+	config.AzureTenantID = tenantID
+
+	var authorizer autorest.Authorizer
+
+	azureEnv := determineCloudByRegion(az.clusterRegion)
+
+	if config.AzureClientID != "" && config.AzureClientSecret != "" && config.AzureTenantID != "" {
+		credentialsConfig := NewClientCredentialsConfig(config.AzureClientID, config.AzureClientSecret, config.AzureTenantID, azureEnv)
+		a, err := credentialsConfig.Authorizer()
+		if err != nil {
+			az.RateCardPricingError = err
+			return nil, err
+		}
+		authorizer = a
+	}
+
+	if authorizer == nil {
+		a, err := auth.NewAuthorizerFromEnvironment()
+		authorizer = a
+		if err != nil {
+			a, err := auth.NewAuthorizerFromFile(azureEnv.ResourceManagerEndpoint)
+			if err != nil {
+				az.RateCardPricingError = err
+				return nil, err
+			}
+			authorizer = a
+		}
+	}
+	client := compute.NewDisksClient(config.AzureSubscriptionID)
+	client.Authorizer = authorizer
+
+	ctx := context.TODO()
+
+	var disks []*compute.Disk
+
+	diskPage, err := client.List(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("error getting disks: %v", err)
+	}
+
+	for diskPage.NotDone() {
+		for _, d := range diskPage.Values() {
+			d := d
+			disks = append(disks, &d)
+		}
+		err := diskPage.Next()
+		if err != nil {
+			return nil, fmt.Errorf("error getting next page: %v", err)
+		}
+	}
+
+	return disks, nil
+}
+
+func isDiskOrphaned(disk *compute.Disk) bool {
+	//TODO: needs better algorithm
+	return disk.DiskState == "Unattached" || disk.DiskState == "Reserved"
+}
+
+func (az *Azure) GetOrphanedResources() ([]OrphanedResource, error) {
+	disks, err := az.getDisks()
+	if err != nil {
+		return nil, err
+	}
+
+	var orphanedResources []OrphanedResource
+
+	for _, d := range disks {
+		if isDiskOrphaned(d) {
+			cost, err := az.findCostForDisk(d)
+			if err != nil {
+				return nil, err
+			}
+
+			or := OrphanedResource{
+				Kind:   "disk",
+				Region: *d.Location,
+				Description: map[string]string{
+					"disk state":   string(d.DiskState),
+					"time created": d.TimeCreated.String(),
+				},
+				Size:        d.DiskSizeGB,
+				MonthlyCost: cost,
+			}
+			orphanedResources = append(orphanedResources, or)
+		}
+	}
+
+	return orphanedResources, nil
+}
+
+func (az *Azure) findCostForDisk(d *compute.Disk) (*float64, error) {
+	storageClass := string(d.Sku.Name)
+	if strings.EqualFold(storageClass, "Premium_LRS") {
+		storageClass = AzureDiskPremiumSSDStorageClass
+	} else if strings.EqualFold(storageClass, "StandardSSD_LRS") {
+		storageClass = AzureDiskStandardSSDStorageClass
+	} else if strings.EqualFold(storageClass, "Standard_LRS") {
+		storageClass = AzureDiskStandardStorageClass
+	}
+
+	key := *d.Location + "," + storageClass
+
+	diskCost, err := strconv.ParseFloat(az.Pricing[key].PV.Cost, 64)
+	if err != nil {
+		return nil, fmt.Errorf("error converting to float: %s", err)
+	}
+	cost := diskCost * hoursPerMonth * float64(*d.DiskSizeGB)
+
+	return &cost, nil
 }
 
 func (az *Azure) ClusterInfo() (map[string]string, error) {
