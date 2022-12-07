@@ -42,7 +42,7 @@ require (
 	github.com/rs/cors v1.7.0
 	github.com/rs/zerolog v1.26.1
 	github.com/scaleway/scaleway-sdk-go v1.0.0-beta.9
-	github.com/spf13/cobra v1.2.1
+	github.com/spf13/cobra v1.6.1
 	github.com/spf13/viper v1.8.1
 	go.etcd.io/bbolt v1.3.5
 	golang.org/x/exp v0.0.0-20220609121020-a51bd0440498
@@ -96,7 +96,7 @@ require (
 	github.com/hashicorp/golang-lru v0.5.1 // indirect
 	github.com/hashicorp/hcl v1.0.0 // indirect
 	github.com/imdario/mergo v0.3.5 // indirect
-	github.com/inconshreveable/mousetrap v1.0.0 // indirect
+	github.com/inconshreveable/mousetrap v1.0.1 // indirect
 	github.com/jmespath/go-jmespath v0.4.0 // indirect
 	github.com/jstemmer/go-junit-report v0.9.1 // indirect
 	github.com/klauspost/compress v1.13.5 // indirect
