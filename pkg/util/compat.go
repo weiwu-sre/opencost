@@ -31,6 +31,8 @@ func GetInstanceType(labels map[string]string) (string, bool) {
 		return labels[v1.LabelInstanceType], true
 	} else if _, ok := labels["node.kubernetes.io/instance-type"]; ok {
 		return labels["node.kubernetes.io/instance-type"], true
+	} else if _, ok := labels["aws.instance.type"]; ok {
+		return labels["aws.instance.type"], true
 	} else {
 		return "", false
 	}
